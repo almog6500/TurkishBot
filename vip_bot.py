@@ -1,6 +1,6 @@
 """
-VIP Telegram Bot — ניהול מלא עם כפתורים
-שלח /admin לבוט בפרטי לפתיחת תפריט הניהול
+VIP Telegram Bot — Production Ready
+שלח /admin לבוט בפרטי לתפריט ניהול
 """
 
 import json, logging, sqlite3
@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters, ConversationHandler
+    CallbackQueryHandler, ContextTypes, filters
 )
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────
@@ -17,13 +17,6 @@ ADMIN_CHAT_ID = 217420509
 VIP_GROUP_ID  = -1003803654378
 SETTINGS_FILE = "settings.json"
 DB_FILE       = "vip_bot.db"
-
-# Conversation states
-(
-    WAIT_WELCOME, WAIT_PLAN_NAME, WAIT_PLAN_PRICE,
-    WAIT_PLAN_DAYS, WAIT_PLAN_LINK, WAIT_NEW_LINK,
-    WAIT_BROADCAST
-) = range(7)
 # ─────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -102,13 +95,13 @@ def db_remove_member(user_id):
 
 def db_count_members():
     con = sqlite3.connect(DB_FILE)
-    count = con.execute("SELECT COUNT(*) FROM members").fetchone()[0]
-    con.close(); return count
+    c = con.execute("SELECT COUNT(*) FROM members").fetchone()[0]
+    con.close(); return c
 
 def db_count_pending():
     con = sqlite3.connect(DB_FILE)
-    count = con.execute("SELECT COUNT(*) FROM pending").fetchone()[0]
-    con.close(); return count
+    c = con.execute("SELECT COUNT(*) FROM pending").fetchone()[0]
+    con.close(); return c
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -125,21 +118,59 @@ def build_plans_keyboard():
     ])
 
 
+# ── אישור/דחייה — פונקציה משותפת ─────────────────────────────────────────────
+async def do_approve(user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> str:
+    """מאשר משתמש, שולח קישור, מחזיר תיאור לתצוגה"""
+    row = db_get_pending(user_id)
+    if not row:
+        return None
+    _, username, full_name, plan_str, _, _ = row
+    plans = get_plans()
+    days = next((int(p.get("days", 30)) for p in plans if plan_label(p) == plan_str), 30)
+    expires = db_save_member(user_id, username, full_name, plan_str, days)
+    db_remove_pending(user_id)
+    expire_str = datetime.fromisoformat(expires).strftime("%d/%m/%Y")
+    try:
+        invite = await ctx.bot.create_chat_invite_link(
+            chat_id=VIP_GROUP_ID, member_limit=1,
+            expire_date=datetime.now() + timedelta(hours=24), name=f"VIP-{user_id}")
+        await ctx.bot.send_message(
+            user_id,
+            f"🎉 *אושרת לקבוצת ה-VIP!*\n\n📦 {plan_str}\n📅 עד: {expire_str}\n\n👇 קישור לקבוצה:\n{invite.invite_link}\n\nמחכים לך! ❤️",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await ctx.bot.send_message(user_id, f"🎉 אושרת! עד {expire_str}. האדמין ישלח קישור בקרוב.")
+        log.error(f"Invite error: {e}")
+    return f"✅ אושר — {full_name} | עד {expire_str}"
+
+
+async def do_reject(user_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> str:
+    """דוחה משתמש, מחזיר תיאור לתצוגה"""
+    row = db_get_pending(user_id)
+    if not row:
+        return None
+    _, _, full_name, _, _, _ = row
+    db_remove_pending(user_id)
+    await ctx.bot.send_message(user_id, "❌ הבקשה לא אושרה. שלח שוב אם מדובר בטעות.")
+    return f"❌ נדחה — {full_name}"
+
+
 # ════════════════════════════════════════════════════════════════════════════════
 #  תפריט אדמין
 # ════════════════════════════════════════════════════════════════════════════════
 
-def admin_main_menu():
+def admin_main_keyboard():
     pending = db_count_pending()
     members = db_count_members()
-    pending_text = f"⏳ בקשות ממתינות ({pending})" if pending > 0 else "⏳ בקשות ממתינות"
+    pending_label = f"⏳ בקשות ממתינות ({pending}) 🔴" if pending > 0 else "⏳ בקשות ממתינות"
     return (
         f"👑 *תפריט ניהול VIP*\n\n"
         f"👥 חברים פעילים: *{members}*\n"
         f"⏳ ממתינים לאישור: *{pending}*\n\n"
         f"בחר פעולה:",
         InlineKeyboardMarkup([
-            [InlineKeyboardButton(pending_text, callback_data="admin:pending")],
+            [InlineKeyboardButton(pending_label, callback_data="admin:pending")],
             [InlineKeyboardButton("👥 חברים פעילים", callback_data="admin:members")],
             [InlineKeyboardButton("📦 ניהול חבילות", callback_data="admin:plans")],
             [InlineKeyboardButton("✏️ הודעת פתיחה", callback_data="admin:welcome")],
@@ -148,9 +179,34 @@ def admin_main_menu():
     )
 
 
+def pending_menu_content():
+    """בונה את תוכן תפריט הבקשות הממתינות"""
+    rows = db_get_pending()
+    if not rows:
+        return (
+            "✅ *אין בקשות ממתינות*\nכולם טופלו!",
+            InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה לתפריט", callback_data="admin:home")]])
+        )
+    text = f"⏳ *בקשות ממתינות ({len(rows)}):*\n\n"
+    buttons = []
+    for row in rows:
+        user_id, username, full_name, plan, file_id, submitted_at = row
+        text += f"👤 *{full_name}*\n📱 @{username or '-'} | 🆔 `{user_id}`\n📦 {plan}\n\n"
+        buttons.append([
+            InlineKeyboardButton(f"✅ אשר — {full_name}", callback_data=f"adm_approve:{user_id}"),
+            InlineKeyboardButton(f"❌ דחה", callback_data=f"adm_reject:{user_id}"),
+        ])
+        # כפתור לצפייה בתמונה
+        buttons.append([
+            InlineKeyboardButton(f"🖼 הצג צילום מסך", callback_data=f"adm_photo:{user_id}"),
+        ])
+    buttons.append([InlineKeyboardButton("🔙 חזרה לתפריט", callback_data="admin:home")])
+    return text, InlineKeyboardMarkup(buttons)
+
+
 async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
-    text, keyboard = admin_main_menu()
+    text, keyboard = admin_main_keyboard()
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
 
 
@@ -161,146 +217,144 @@ async def cb_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
 
-    # ── חזרה לתפריט ראשי ──
+    # ── תפריט ראשי ──
     if data == "admin:home":
-        text, keyboard = admin_main_menu()
+        text, keyboard = admin_main_keyboard()
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
 
     # ── בקשות ממתינות ──
     elif data == "admin:pending":
-        rows = db_get_pending()
-        if not rows:
-            await query.edit_message_text(
-                "✅ *אין בקשות ממתינות*\nכולם טופלו!",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="admin:home")]])
+        text, keyboard = pending_menu_content()
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+    # ── אישור מתוך תפריט ──
+    elif data.startswith("adm_approve:"):
+        user_id = int(data.split(":")[-1])
+        result = await do_approve(user_id, ctx)
+        await query.answer(result or "לא נמצאה בקשה", show_alert=True)
+        # רענן את תפריט הממתינים
+        text, keyboard = pending_menu_content()
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+    # ── דחייה מתוך תפריט ──
+    elif data.startswith("adm_reject:"):
+        user_id = int(data.split(":")[-1])
+        result = await do_reject(user_id, ctx)
+        await query.answer(result or "לא נמצאה בקשה", show_alert=True)
+        text, keyboard = pending_menu_content()
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+    # ── הצגת צילום מסך ──
+    elif data.startswith("adm_photo:"):
+        user_id = int(data.split(":")[-1])
+        row = db_get_pending(user_id)
+        if row:
+            _, username, full_name, plan, file_id, _ = row
+            await ctx.bot.send_photo(
+                chat_id=ADMIN_CHAT_ID,
+                photo=file_id,
+                caption=f"🖼 צילום מסך של {full_name}\n📦 {plan}",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ אשר", callback_data=f"adm_approve:{user_id}"),
+                    InlineKeyboardButton("❌ דחה", callback_data=f"adm_reject:{user_id}"),
+                ]])
             )
-            return
-        text = f"⏳ *בקשות ממתינות ({len(rows)}):*\n\n"
-        buttons = []
-        for row in rows:
-            user_id, username, full_name, plan, file_id, submitted_at = row
-            text += f"👤 {full_name} (@{username or '-'})\n📦 {plan}\n🆔 `{user_id}`\n\n"
-            buttons.append([
-                InlineKeyboardButton(f"✅ אשר — {full_name}", callback_data=f"approve:{user_id}"),
-            ])
-            buttons.append([
-                InlineKeyboardButton(f"❌ דחה — {full_name}", callback_data=f"reject:{user_id}"),
-            ])
-        buttons.append([InlineKeyboardButton("🔙 חזרה", callback_data="admin:home")])
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+        else:
+            await query.answer("לא נמצא צילום מסך", show_alert=True)
 
     # ── חברים פעילים ──
     elif data == "admin:members":
         rows = db_get_members()
         if not rows:
-            await query.edit_message_text(
-                "👥 *אין חברים פעילים כרגע*",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="admin:home")]])
-            )
+            await query.edit_message_text("👥 *אין חברים פעילים כרגע*", parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="admin:home")]]))
             return
         text = f"👥 *חברים פעילים ({len(rows)}):*\n\n"
         buttons = []
         for row in rows:
-            user_id, username, full_name, plan, expires_at, _ = row
+            uid, username, full_name, plan, expires_at, _ = row
             days = max(0, (datetime.fromisoformat(expires_at) - datetime.now()).days)
             expire_str = datetime.fromisoformat(expires_at).strftime("%d/%m/%Y")
             icon = "🔴" if days < 7 else "🟢"
-            text += f"{icon} {full_name} (@{username or '-'})\n📦 {plan}\n📅 עד {expire_str} ({days} ימים)\n🆔 `{user_id}`\n\n"
-            buttons.append([InlineKeyboardButton(f"🗑 הסר — {full_name}", callback_data=f"kick:{user_id}")])
+            text += f"{icon} *{full_name}* (@{username or '-'})\n📦 {plan} | עד {expire_str} ({days} ימים)\n🆔 `{uid}`\n\n"
+            buttons.append([InlineKeyboardButton(f"🗑 הסר — {full_name}", callback_data=f"kick:{uid}")])
         buttons.append([InlineKeyboardButton("🔙 חזרה", callback_data="admin:home")])
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
 
     # ── ניהול חבילות ──
     elif data == "admin:plans":
-        plans = get_plans()
-        text = "📦 *ניהול חבילות:*\n\n"
-        buttons = []
-        if plans:
-            for i, p in enumerate(plans, 1):
-                link = p.get("payment_link", "")
-                text += f"*{i}.* {plan_label(p)} | {p['days']} ימים\n🔗 {link or 'ללא קישור'}\n\n"
-                buttons.append([
-                    InlineKeyboardButton(f"🔗 שנה קישור — {p['name']}", callback_data=f"admin:setlink:{i-1}"),
-                    InlineKeyboardButton(f"🗑 מחק", callback_data=f"admin:delplan:{i-1}"),
-                ])
-        else:
-            text += "אין חבילות עדיין.\n\n"
-        buttons.append([InlineKeyboardButton("➕ הוסף חבילה חדשה", callback_data="admin:addplan")])
-        buttons.append([InlineKeyboardButton("🔙 חזרה", callback_data="admin:home")])
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+        await show_plans_menu(query)
 
-    # ── מחיקת חבילה ──
     elif data.startswith("admin:delplan:"):
         idx = int(data.split(":")[-1])
         s = load_settings()
         if idx < len(s["plans"]):
             removed = s["plans"].pop(idx)
             save_settings(s)
-            await query.answer(f"✅ החבילה '{removed['name']}' נמחקה", show_alert=True)
-        # חזרה לתפריט חבילות
-        plans = get_plans()
-        text = "📦 *ניהול חבילות:*\n\n"
-        buttons = []
-        if plans:
-            for i, p in enumerate(plans, 1):
-                link = p.get("payment_link", "")
-                text += f"*{i}.* {plan_label(p)} | {p['days']} ימים\n🔗 {link or 'ללא קישור'}\n\n"
-                buttons.append([
-                    InlineKeyboardButton(f"🔗 שנה קישור — {p['name']}", callback_data=f"admin:setlink:{i-1}"),
-                    InlineKeyboardButton(f"🗑 מחק", callback_data=f"admin:delplan:{i-1}"),
-                ])
-        else:
-            text += "אין חבילות עדיין.\n\n"
-        buttons.append([InlineKeyboardButton("➕ הוסף חבילה חדשה", callback_data="admin:addplan")])
-        buttons.append([InlineKeyboardButton("🔙 חזרה", callback_data="admin:home")])
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+            await query.answer(f"✅ נמחקה: {removed['name']}", show_alert=True)
+        await show_plans_menu(query)
 
-    # ── שינוי קישור לחבילה ──
     elif data.startswith("admin:setlink:"):
         idx = int(data.split(":")[-1])
         ctx.user_data["editing_plan_idx"] = idx
-        plans = get_plans()
-        plan_name = plans[idx]["name"] if idx < len(plans) else ""
-        await query.edit_message_text(
-            f"🔗 *שינוי קישור תשלום*\n\nחבילה: *{plan_name}*\n\nשלח את הקישור החדש:",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ ביטול", callback_data="admin:plans")]])
-        )
         ctx.user_data["admin_action"] = "wait_link"
-
-    # ── הוסף חבילה ──
-    elif data == "admin:addplan":
+        plans = get_plans()
+        name = plans[idx]["name"] if idx < len(plans) else ""
         await query.edit_message_text(
-            "➕ *הוספת חבילה חדשה*\n\nשלח את *שם החבילה*:\n\nלדוגמה: גישה חודשית",
+            f"🔗 *שינוי קישור תשלום*\nחבילה: *{name}*\n\nשלח את הקישור החדש:",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ ביטול", callback_data="admin:plans")]])
         )
+
+    elif data == "admin:addplan":
         ctx.user_data["admin_action"] = "wait_plan_name"
         ctx.user_data["new_plan"] = {}
+        await query.edit_message_text(
+            "➕ *הוספת חבילה חדשה*\n\nשלח את *שם החבילה*:\nלדוגמה: גישה חודשית",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ ביטול", callback_data="admin:plans")]])
+        )
 
     # ── הודעת פתיחה ──
     elif data == "admin:welcome":
         current = get_welcome()
-        await query.edit_message_text(
-            f"✏️ *עריכת הודעת פתיחה*\n\n*הנוכחית:*\n{current}\n\n─────────────\nשלח את הטקסט החדש:",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ ביטול", callback_data="admin:home")]])
-        )
         ctx.user_data["admin_action"] = "wait_welcome"
-
-    # ── שליחת הודעה לכולם ──
-    elif data == "admin:broadcast":
         await query.edit_message_text(
-            "📢 *שליחת הודעה לכל החברים*\n\nשלח את ההודעה שתרצה לשלוח לכולם:",
+            f"✏️ *עריכת הודעת פתיחה*\n\n*נוכחית:*\n{current}\n\n─────────\nשלח את הטקסט החדש:",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ ביטול", callback_data="admin:home")]])
         )
+
+    # ── שליחה לכולם ──
+    elif data == "admin:broadcast":
         ctx.user_data["admin_action"] = "wait_broadcast"
+        await query.edit_message_text(
+            "📢 *שליחת הודעה לכל החברים*\n\nשלח את ההודעה:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ ביטול", callback_data="admin:home")]])
+        )
 
 
-# ── הסרת חבר ──
+async def show_plans_menu(query):
+    plans = get_plans()
+    text = "📦 *ניהול חבילות:*\n\n"
+    buttons = []
+    if plans:
+        for i, p in enumerate(plans, 1):
+            link = p.get("payment_link", "")
+            text += f"*{i}.* {plan_label(p)} | {p['days']} ימים\n🔗 {link or 'ללא קישור'}\n\n"
+            buttons.append([
+                InlineKeyboardButton(f"🔗 שנה קישור", callback_data=f"admin:setlink:{i-1}"),
+                InlineKeyboardButton(f"🗑 מחק", callback_data=f"admin:delplan:{i-1}"),
+            ])
+    else:
+        text += "אין חבילות עדיין.\n\n"
+    buttons.append([InlineKeyboardButton("➕ הוסף חבילה", callback_data="admin:addplan")])
+    buttons.append([InlineKeyboardButton("🔙 חזרה", callback_data="admin:home")])
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+# ── הסרת חבר ──────────────────────────────────────────────────────────────────
 async def cb_kick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if update.effective_user.id != ADMIN_CHAT_ID:
@@ -328,37 +382,52 @@ async def cb_kick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         days = max(0, (datetime.fromisoformat(expires_at) - datetime.now()).days)
         expire_str = datetime.fromisoformat(expires_at).strftime("%d/%m/%Y")
         icon = "🔴" if days < 7 else "🟢"
-        text += f"{icon} {full_name} (@{username or '-'})\n📦 {plan} | עד {expire_str} ({days} ימים)\n🆔 `{uid}`\n\n"
+        text += f"{icon} *{full_name}* (@{username or '-'})\n📦 {plan} | עד {expire_str} ({days} ימים)\n🆔 `{uid}`\n\n"
         buttons.append([InlineKeyboardButton(f"🗑 הסר — {full_name}", callback_data=f"kick:{uid}")])
     buttons.append([InlineKeyboardButton("🔙 חזרה", callback_data="admin:home")])
     await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
 
 
-# ── קבלת טקסט מהאדמין (לפי מצב) ─────────────────────────────────────────────
+# ── אישור/דחייה ישירות מהתמונה שנשלחת לאדמין ────────────────────────────────
+async def cb_approve_reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if update.effective_user.id != ADMIN_CHAT_ID:
+        await query.answer("אין הרשאה!", show_alert=True); return
+    await query.answer()
+    action, uid_str = query.data.split(":")
+    user_id = int(uid_str)
+
+    if action == "approve":
+        result = await do_approve(user_id, ctx)
+        await query.edit_message_caption(result or "הבקשה כבר טופלה")
+    elif action == "reject":
+        result = await do_reject(user_id, ctx)
+        await query.edit_message_caption(result or "הבקשה כבר טופלה")
+
+
+# ── קבלת טקסט מהאדמין ────────────────────────────────────────────────────────
 async def handle_admin_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
     action = ctx.user_data.get("admin_action")
+    if not action: return
     text = update.message.text.strip()
 
-    # ── שינוי הודעת פתיחה ──
     if action == "wait_welcome":
         s = load_settings()
         s["welcome_message"] = text
         save_settings(s)
         ctx.user_data.pop("admin_action", None)
-        admin_text, keyboard = admin_main_menu()
-        await update.message.reply_text(f"✅ *הודעת הפתיחה עודכנה!*\n\n{text}", parse_mode="Markdown")
-        await update.message.reply_text(admin_text, parse_mode="Markdown", reply_markup=keyboard)
+        await update.message.reply_text(f"✅ *הודעת הפתיחה עודכנה!*", parse_mode="Markdown")
+        t, kb = admin_main_keyboard()
+        await update.message.reply_text(t, parse_mode="Markdown", reply_markup=kb)
 
-    # ── שינוי קישור תשלום ──
     elif action == "wait_link":
         idx = ctx.user_data.get("editing_plan_idx", 0)
         s = load_settings()
         if idx < len(s["plans"]):
             s["plans"][idx]["payment_link"] = text
             save_settings(s)
-            plan_name = s["plans"][idx]["name"]
-            await update.message.reply_text(f"✅ *הקישור עודכן!*\nחבילה: {plan_name}\n🔗 {text}", parse_mode="Markdown")
+            await update.message.reply_text(f"✅ *הקישור עודכן!*\n🔗 {text}", parse_mode="Markdown")
         ctx.user_data.pop("admin_action", None)
         ctx.user_data.pop("editing_plan_idx", None)
         # חזרה לתפריט חבילות
@@ -369,32 +438,28 @@ async def handle_admin_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             link = p.get("payment_link", "")
             menu_text += f"*{i}.* {plan_label(p)} | {p['days']} ימים\n🔗 {link or 'ללא קישור'}\n\n"
             buttons.append([
-                InlineKeyboardButton(f"🔗 שנה קישור — {p['name']}", callback_data=f"admin:setlink:{i-1}"),
+                InlineKeyboardButton(f"🔗 שנה קישור", callback_data=f"admin:setlink:{i-1}"),
                 InlineKeyboardButton(f"🗑 מחק", callback_data=f"admin:delplan:{i-1}"),
             ])
-        buttons.append([InlineKeyboardButton("➕ הוסף חבילה חדשה", callback_data="admin:addplan")])
+        buttons.append([InlineKeyboardButton("➕ הוסף חבילה", callback_data="admin:addplan")])
         buttons.append([InlineKeyboardButton("🔙 חזרה", callback_data="admin:home")])
         await update.message.reply_text(menu_text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
 
-    # ── הוספת חבילה — שם ──
     elif action == "wait_plan_name":
         ctx.user_data["new_plan"]["name"] = text
         ctx.user_data["admin_action"] = "wait_plan_price"
-        await update.message.reply_text(f"✅ שם: *{text}*\n\nעכשיו שלח את *המחיר* (ב-₪):\nלדוגמה: 20", parse_mode="Markdown")
+        await update.message.reply_text(f"✅ שם: *{text}*\n\nשלח את *המחיר* (₪):", parse_mode="Markdown")
 
-    # ── הוספת חבילה — מחיר ──
     elif action == "wait_plan_price":
         ctx.user_data["new_plan"]["price"] = text
         ctx.user_data["admin_action"] = "wait_plan_days"
-        await update.message.reply_text(f"✅ מחיר: *{text}₪*\n\nעכשיו שלח *כמה ימי גישה*:\nלדוגמה: 30", parse_mode="Markdown")
+        await update.message.reply_text(f"✅ מחיר: *{text}₪*\n\nשלח *כמה ימי גישה*:", parse_mode="Markdown")
 
-    # ── הוספת חבילה — ימים ──
     elif action == "wait_plan_days":
         ctx.user_data["new_plan"]["days"] = int(text) if text.isdigit() else 30
         ctx.user_data["admin_action"] = "wait_plan_link"
-        await update.message.reply_text(f"✅ ימים: *{text}*\n\nעכשיו שלח את *קישור התשלום*:\nאו שלח ❌ לדלג", parse_mode="Markdown")
+        await update.message.reply_text(f"✅ ימים: *{text}*\n\nשלח *קישור תשלום*\n(או שלח ❌ לדלג):", parse_mode="Markdown")
 
-    # ── הוספת חבילה — קישור ──
     elif action == "wait_plan_link":
         new_plan = ctx.user_data.get("new_plan", {})
         new_plan["payment_link"] = "" if text == "❌" else text
@@ -404,41 +469,25 @@ async def handle_admin_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data.pop("admin_action", None)
         ctx.user_data.pop("new_plan", None)
         await update.message.reply_text(
-            f"✅ *החבילה נוספה!*\n\n"
-            f"📦 {plan_label(new_plan)}\n"
-            f"⏱ {new_plan['days']} ימים\n"
-            f"🔗 {new_plan.get('payment_link') or 'ללא קישור'}",
+            f"✅ *החבילה נוספה!*\n\n📦 {plan_label(new_plan)}\n⏱ {new_plan['days']} ימים\n🔗 {new_plan.get('payment_link') or 'ללא קישור'}",
             parse_mode="Markdown"
         )
-        plans = get_plans()
-        menu_text = "📦 *ניהול חבילות:*\n\n"
-        buttons = []
-        for i, p in enumerate(plans, 1):
-            link = p.get("payment_link", "")
-            menu_text += f"*{i}.* {plan_label(p)} | {p['days']} ימים\n🔗 {link or 'ללא קישור'}\n\n"
-            buttons.append([
-                InlineKeyboardButton(f"🔗 שנה קישור — {p['name']}", callback_data=f"admin:setlink:{i-1}"),
-                InlineKeyboardButton(f"🗑 מחק", callback_data=f"admin:delplan:{i-1}"),
-            ])
-        buttons.append([InlineKeyboardButton("➕ הוסף חבילה חדשה", callback_data="admin:addplan")])
-        buttons.append([InlineKeyboardButton("🔙 חזרה", callback_data="admin:home")])
-        await update.message.reply_text(menu_text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+        t, kb = admin_main_keyboard()
+        await update.message.reply_text(t, parse_mode="Markdown", reply_markup=kb)
 
-    # ── שליחת הודעה לכולם ──
     elif action == "wait_broadcast":
         rows = db_get_members()
         success = 0
         for row in rows:
-            user_id = row[0]
             try:
-                await ctx.bot.send_message(user_id, f"📢 *הודעה מהאדמין:*\n\n{text}", parse_mode="Markdown")
+                await ctx.bot.send_message(row[0], f"📢 *הודעה מהאדמין:*\n\n{text}", parse_mode="Markdown")
                 success += 1
             except Exception as e:
-                log.warning(f"Broadcast failed for {user_id}: {e}")
+                log.warning(f"Broadcast failed {row[0]}: {e}")
         ctx.user_data.pop("admin_action", None)
-        admin_text, keyboard = admin_main_menu()
-        await update.message.reply_text(f"✅ *ההודעה נשלחה!*\n\nנשלח בהצלחה ל-{success} חברים.", parse_mode="Markdown")
-        await update.message.reply_text(admin_text, parse_mode="Markdown", reply_markup=keyboard)
+        await update.message.reply_text(f"✅ נשלח ל-{success} חברים.")
+        t, kb = admin_main_keyboard()
+        await update.message.reply_text(t, parse_mode="Markdown", reply_markup=kb)
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -481,60 +530,29 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     db_save_pending(user.id, user.username or "", user.full_name, plan_str, file_id)
     ctx.user_data["step"] = "pending_approval"
 
+    # ✅ התראה מיידית לאדמין עם כפתורי אישור/דחייה על התמונה
     caption = (
-        f"💳 *בקשת הצטרפות חדשה*\n\n"
+        f"🔔 *בקשה חדשה!*\n\n"
         f"👤 {user.full_name}\n"
         f"📱 @{user.username or 'אין'}\n"
         f"🆔 `{user.id}`\n"
         f"📦 {plan_str}"
     )
     await ctx.bot.send_photo(
-        chat_id=ADMIN_CHAT_ID, photo=file_id, caption=caption, parse_mode="Markdown",
+        chat_id=ADMIN_CHAT_ID,
+        photo=file_id,
+        caption=caption,
+        parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ אשר", callback_data=f"approve:{user.id}"),
             InlineKeyboardButton("❌ דחה",  callback_data=f"reject:{user.id}"),
         ]])
     )
-    await update.message.reply_text("📨 *התקבל!*\n⏳ ממתין לאישור — נעדכן אותך בקרוב 🙏", parse_mode="Markdown")
 
-
-# ── אישור/דחייה ──────────────────────────────────────────────────────────────
-async def cb_approve_reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if update.effective_user.id != ADMIN_CHAT_ID:
-        await query.answer("אין הרשאה!", show_alert=True); return
-    await query.answer()
-
-    action, uid_str = query.data.split(":")
-    user_id = int(uid_str)
-    row = db_get_pending(user_id)
-    if not row:
-        await query.edit_message_caption("הבקשה כבר טופלה."); return
-
-    _, username, full_name, plan_str, _, _ = row
-
-    if action == "approve":
-        plans = get_plans()
-        days = next((int(p.get("days", 30)) for p in plans if plan_label(p) == plan_str), 30)
-        expires = db_save_member(user_id, username, full_name, plan_str, days)
-        db_remove_pending(user_id)
-        expire_str = datetime.fromisoformat(expires).strftime("%d/%m/%Y")
-        try:
-            invite = await ctx.bot.create_chat_invite_link(
-                chat_id=VIP_GROUP_ID, member_limit=1,
-                expire_date=datetime.now() + timedelta(hours=24), name=f"VIP-{user_id}")
-            await ctx.bot.send_message(user_id,
-                f"🎉 *אושרת לקבוצת ה-VIP!*\n\n📦 {plan_str}\n📅 עד: {expire_str}\n\n👇 קישור לקבוצה:\n{invite.invite_link}\n\nמחכים לך! ❤️",
-                parse_mode="Markdown")
-        except Exception as e:
-            await ctx.bot.send_message(user_id, f"🎉 אושרת! עד {expire_str}. האדמין ישלח קישור בקרוב.")
-            log.error(f"Invite error: {e}")
-        await query.edit_message_caption(f"✅ אושר — {full_name} | עד {expire_str}")
-
-    elif action == "reject":
-        db_remove_pending(user_id)
-        await ctx.bot.send_message(user_id, "❌ הבקשה לא אושרה. שלח שוב אם מדובר בטעות.")
-        await query.edit_message_caption(f"❌ נדחה — {full_name}")
+    await update.message.reply_text(
+        "📨 *התקבל!*\n⏳ ממתין לאישור — נעדכן אותך בקרוב 🙏",
+        parse_mode="Markdown"
+    )
 
 
 # ── בדיקת פקיעת מנויים ───────────────────────────────────────────────────────
@@ -547,7 +565,7 @@ async def check_expirations(ctx: ContextTypes.DEFAULT_TYPE):
             await ctx.bot.ban_chat_member(VIP_GROUP_ID, user_id)
             await ctx.bot.unban_chat_member(VIP_GROUP_ID, user_id)
             await ctx.bot.send_message(user_id, "⏰ *המנוי שלך פג תוקף.*\n\nלחדש: /start", parse_mode="Markdown")
-            await ctx.bot.send_message(ADMIN_CHAT_ID, f"ℹ️ המנוי של {full_name} (`{user_id}`) פג — הוסר מהקבוצה.", parse_mode="Markdown")
+            await ctx.bot.send_message(ADMIN_CHAT_ID, f"ℹ️ המנוי של {full_name} (`{user_id}`) פג — הוסר.", parse_mode="Markdown")
         except Exception as e:
             log.warning(f"Could not remove {user_id}: {e}")
         con.execute("DELETE FROM members WHERE user_id=?", (user_id,))
@@ -559,18 +577,19 @@ def main():
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # משתמש
+    # משתמש רגיל
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_photo))
     app.add_handler(CallbackQueryHandler(cb_plan_chosen, pattern=r"^plan:"))
 
-    # אדמין — תפריט
+    # אדמין — תפריט כפתורים
     app.add_handler(CommandHandler("admin", cmd_admin))
-    app.add_handler(CallbackQueryHandler(cb_admin, pattern=r"^admin:"))
-    app.add_handler(CallbackQueryHandler(cb_kick, pattern=r"^kick:"))
+    app.add_handler(CallbackQueryHandler(cb_admin,         pattern=r"^admin:"))
+    app.add_handler(CallbackQueryHandler(cb_admin,         pattern=r"^adm_(approve|reject|photo):"))
+    app.add_handler(CallbackQueryHandler(cb_kick,          pattern=r"^kick:"))
     app.add_handler(CallbackQueryHandler(cb_approve_reject, pattern=r"^(approve|reject):"))
 
-    # קבלת טקסט מאדמין
+    # טקסט מאדמין
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.User(ADMIN_CHAT_ID),
         handle_admin_text
