@@ -65,3 +65,5 @@ def handle_admin_approval(call):
         bot.edit_message_caption(caption="התשלום נדחה והמשתמש עודכן.", chat_id=call.message.chat.id, message_id=call.message.message_id)
 
 bot.polling(none_stop=True)
+bot.remove_webhook()
+bot.polling(none_stop=True)
